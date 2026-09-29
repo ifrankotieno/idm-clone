@@ -3,7 +3,6 @@ import asyncio
 import mimetypes
 import os
 import re
-import shutil
 import tempfile
 import threading
 import time
@@ -14,6 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 import aiofiles
 import aiohttp
+from core.media_tools import media_options, explain_media_error
 
 
 class DownloadStatus(Enum):
@@ -222,20 +222,31 @@ class MultiConnectionDownloader:
             if task.total_size and task.downloaded != task.total_size:
                 raise ValueError("Incomplete download")
 
-    def _download_media(self, task, callback):
+    def _download_media(self, task, callback, _hls_retry=False):
         from yt_dlp import YoutubeDL
+
+        warnings = []
+        stream_bytes = {}
+        stream_sizes = {}
+        tools = media_options()
+        if _hls_retry:
+            tools["format"] = "bestvideo*[protocol^=m3u8]+bestaudio[protocol^=m3u8]/best[protocol^=m3u8]"
 
         class QuietLogger:
             def debug(self, message): pass
-            def warning(self, message): pass
+            def warning(self, message): warnings.append(message)
             def error(self, message): pass
 
         def hook(info):
             task._pause_event.wait()
             if task._cancel:
                 raise ValueError("Download cancelled")
-            task.downloaded = info.get("downloaded_bytes", task.downloaded)
-            task.total_size = info.get("total_bytes") or info.get("total_bytes_estimate") or 0
+            if "downloaded_bytes" in info:
+                stream = info.get("filename", "media")
+                stream_bytes[stream] = info["downloaded_bytes"]
+                stream_sizes[stream] = info.get("total_bytes") or info.get("total_bytes_estimate") or 0
+                task.downloaded = sum(stream_bytes.values())
+                task.total_size = sum(stream_sizes.values())
             self._progress(task, callback)
 
         directory = Path(task.save_path).parent
@@ -244,10 +255,10 @@ class MultiConnectionDownloader:
         try:
             with tempfile.TemporaryDirectory(prefix=".idm-media-", dir=directory) as scratch:
                 options = {
-                    "format": "bestvideo+bestaudio/best" if shutil.which("ffmpeg") else "best",
+                    **tools,
                     "outtmpl": str(Path(scratch) / "%(title).120B.%(ext)s"),
                     "windowsfilenames": True, "noplaylist": True,
-                    "quiet": True, "no_warnings": True, "logger": QuietLogger(),
+                    "quiet": True, "logger": QuietLogger(),
                     "http_headers": task.headers, "progress_hooks": [hook],
                     "socket_timeout": 30, "retries": 2,
                 }
@@ -271,10 +282,20 @@ class MultiConnectionDownloader:
                 task.save_path = str(target)
                 os.replace(source, target)
                 task.downloaded = target.stat().st_size
-        except Exception:
+        except Exception as exc:
             if target:
                 target.unlink(missing_ok=True)
-            raise
+            hostname = (urlsplit(task.url).hostname or "").lower()
+            youtube = hostname == "youtu.be" or hostname == "youtube.com" or hostname.endswith(".youtube.com")
+            # Some public YouTube CDN URLs reject direct HTTP transfers while
+            # the same video's HLS streams are available. Retry once with HLS,
+            # in a fresh scratch directory, without retaining failed fragments.
+            if (not _hls_retry and not task._cancel and youtube
+                    and tools.get("ffmpeg_location") and "HTTP Error 403" in str(exc)):
+                task.downloaded = task.total_size = task._last_downloaded = 0
+                task._last_time = time.monotonic()
+                return self._download_media(task, callback, _hls_retry=True)
+            raise ValueError(explain_media_error(exc, tools, warnings)) from exc
 
     def pause(self, task):
         if task.status == DownloadStatus.DOWNLOADING:

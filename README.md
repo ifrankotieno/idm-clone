@@ -5,7 +5,7 @@ Python desktop download manager with a Microsoft Edge / Chrome extension.
 ## Run the Windows app (no terminal)
 
 Extract **IDMClone-Windows-x64.zip** and double-click **IDMClone/IDMClone.exe**.
-Keep the entire folder together, including `_internal`, `IDMNativeHost.exe`, and
+Keep the entire folder together, including `_internal`, `media-tools`, `IDMNativeHost.exe`, and
 `BrowserSetup.exe`. Python is included in the bundle and is not required on the
 computer running it. Move the folder to its permanent location before browser setup.
 
@@ -45,10 +45,12 @@ requiring browser-only cookies, POST requests, or browser-generated `blob:` data
 - Automatic app launch when the extension sends a download.
 
 Protected/DRM videos, live recordings, playlists, and automatic browser-cookie
-transfer are not supported. Some sites need authentication, an external JavaScript
-runtime, or extractor updates. FFmpeg, if available on PATH, enables separate audio
-and video merging; without it, the app requests a combined format. FFmpeg is not
-bundled. Not every streaming format or website has a combined downloadable format.
+transfer are not supported. Some sites need authentication or extractor updates.
+The Windows bundle includes FFmpeg/FFprobe for merging separate audio/video streams,
+Deno for YouTube JavaScript extraction, and matching yt-dlp-ejs scripts. Tools are
+located next to the app in `media-tools`; a terminal PATH change is not required.
+If a public YouTube direct-media URL returns HTTP 403, the app retries once using
+the video's HLS formats. This does not bypass account, regional or DRM restrictions.
 Native fullscreen video and closed shadow-DOM players may hide the overlay; use the
 extension popup. Pause state does not survive app shutdown. Cancelled/failed partial
 files are removed; completed files are never overwritten.
@@ -60,6 +62,7 @@ Requires Windows and Python 3.11 or newer.
 ```powershell
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
+.venv/Scripts/python.exe scripts/prepare_media_tools.py
 .venv/Scripts/python.exe main.py
 ```
 
@@ -74,12 +77,26 @@ Build the portable bundle:
 
 ```powershell
 .venv/Scripts/python.exe -m pip install -r requirements-build.txt
+.venv/Scripts/python.exe scripts/prepare_media_tools.py
 .venv/Scripts/python.exe scripts/build_windows.py
 ```
 
 Output: `dist/IDMClone/IDMClone.exe` and `dist/IDMClone-Windows-x64.zip`.
 Build products, browser registration paths, virtual environments, and local settings
 are excluded from Git. The build is unsigned.
+
+Media-tool downloads are pinned to upstream release URLs and verified SHA-256
+checksums in `scripts/prepare_media_tools.py`. Dependency licenses and source/build
+references ship in `media-tools`. Keep `yt-dlp[default]` updated as a unit so that
+the extractor and its EJS scripts remain compatible.
+
+### Updating an existing portable copy
+
+Close IDM Clone before replacing its files. Extract the new bundle into your
+existing app location and replace the app files, including `_internal` and
+`media-tools`. Keep your existing `com.idmclone.host.json` registration file.
+If you move the folder, run BrowserSetup.exe again with the same extension ID.
+Start the updated IDMClone.exe and add previously failed downloads again.
 
 Architecture: Edge extension -> native messaging executable -> local TCP command
 server (`127.0.0.1:56789`) -> Tk event queue -> async downloader / yt-dlp worker.
