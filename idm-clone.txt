@@ -1,0 +1,49 @@
+First Dir Structure
+
+idm-clone/
+├── main.py                 # App entry point
+├── gui/
+│   ├── main_window.py
+│   ├── download_item.py
+│   └── settings.py
+├── core/
+│   ├── downloader.py       # Multi-connection engine
+│   ├── queue.py
+│   └── resume.py
+├── browser/
+│   ├── native_host.py      # Native Messaging host
+│   └── extension/          # Chrome/Edge extension
+├── config/
+│   └── settings.json
+└── requirements.txt
+
+Second Dir Structure
+
+IDM-Clone/
+├── browser/
+│   ├── extension/                 # Chrome/Edge extension
+│   │   ├── manifest.json
+│   │   ├── background.js
+│   │   ├── content.js
+│   │   └── icons/                 # (optional)
+│   └── native_host/
+│       ├── idm_native_host.py
+│       └── idm_native_host.bat    # Windows launcher
+├── core/
+├── gui/
+└── main.py
+
+pip install -r requirements.txt
+python main.py
+
+[notice] A new release of pip is available: 26.1.2 -> 26.2.1
+[notice] To update, run: C:\Users\ifran\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe -m pip install --upgrade pip
+
+
+Improve resume support (proper .idm-part metadata so it survives app restart)
+Add a proper download queue + concurrent limit
+Better file naming + “Save As” dialog
+Start browser integration (Chrome/Edge extension + Native Messaging)
+
+Will it be possible to package the final version of the downloader as a .exe file?
+

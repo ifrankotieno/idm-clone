@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.tools/
+build/
+dist/
+*.spec
+*.zip
+*.part
+*.log
+.env
+.env.*
+browser/native_host/com.idmclone.host.json
+browser/native_host/install_native_host.reg
