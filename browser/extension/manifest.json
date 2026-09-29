@@ -1,31 +1,12 @@
 {
   "manifest_version": 3,
   "name": "IDM Clone",
-  "version": "1.0",
-  "description": "Download with IDM Clone",
-  "permissions": [
-    "downloads",
-    "contextMenus",
-    "nativeMessaging",
-    "storage",
-    "tabs",
-    "scripting"
-  ],
-  "host_permissions": [
-    "<all_urls>"
-  ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content.js"],
-      "run_at": "document_idle"
-    }
-  ],
-  "action": {
-    "default_title": "IDM Clone",
-    "default_popup": "popup.html"
-  }
+  "version": "1.1.0",
+  "description": "Download files and supported videos with the IDM Clone desktop app.",
+  "permissions": ["downloads", "contextMenus", "nativeMessaging", "storage", "webRequest"],
+  "host_permissions": ["http://*/*", "https://*/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{"matches": ["http://*/*", "https://*/*"], "js": ["content.js"], "all_frames": true, "run_at": "document_idle"}],
+  "action": {"default_title": "IDM Clone", "default_popup": "popup.html"},
+  "icons": {"16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png"}
 }

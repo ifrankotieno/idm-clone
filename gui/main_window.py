@@ -1,233 +1,192 @@
-import customtkinter as ctk
 import asyncio
+import queue
 import threading
-from tkinter import filedialog, messagebox
+import uuid
 from pathlib import Path
-from core.downloader import MultiConnectionDownloader, DownloadTask, DownloadStatus
+from tkinter import filedialog, messagebox
+from urllib.parse import urlsplit
+
+import customtkinter as ctk
+from core.downloader import MultiConnectionDownloader, DownloadTask, DownloadStatus, safe_filename, validate_url
 from core.command_server import CommandServer
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+
 class DownloadManagerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-
         self.title("IDM Clone - Download Manager")
         self.geometry("1000x600")
         self.minsize(900, 500)
-
-        self.downloader = MultiConnectionDownloader(max_connections=8)
+        self.downloader = MultiConnectionDownloader()
         self.loop = asyncio.new_event_loop()
-        self.tasks_ui = {}  # url -> ui widgets
-
-        # Start asyncio loop in background thread
+        self.events = queue.Queue()
+        self.tasks_ui = {}
+        self.closing = False
         self.thread = threading.Thread(target=self._run_async_loop, daemon=True)
         self.thread.start()
-    
-        self.command_server = CommandServer(self.add_download_from_browser)
-        asyncio.run_coroutine_threadsafe(
-            self.command_server.start(),
-            self.loop
-        )
-    
         self._build_ui()
-    def on_closing(self):
-        asyncio.run_coroutine_threadsafe(self.command_server.stop(), self.loop)
-        asyncio.run_coroutine_threadsafe(self.downloader.close(), self.loop)
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.destroy()
+        self.command_server = CommandServer(lambda message: self.events.put(("command", message)))
+        future = asyncio.run_coroutine_threadsafe(self.command_server.start(), self.loop)
+        future.add_done_callback(self._server_started)
+        self.after(100, self._poll)
+
+    def _server_started(self, future):
+        try:
+            future.result()
+            self.events.put(("status", "Browser bridge ready"))
+        except Exception as exc:
+            self.events.put(("status", f"Browser bridge unavailable: {exc}"))
 
     def _run_async_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
+        self.loop.close()
 
     def _build_ui(self):
-        # Top bar
-        top_frame = ctk.CTkFrame(self)
-        top_frame.pack(fill="x", padx=10, pady=10)
-
-        self.url_entry = ctk.CTkEntry(top_frame, placeholder_text="Enter download URL...", height=36)
-        self.url_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-
-        ctk.CTkButton(top_frame, text="Add Download", width=120, command=self.add_download).pack(side="left", padx=(0, 5))
-        ctk.CTkButton(top_frame, text="Browse...", width=90, command=self.browse_save_path).pack(side="left")
-
-        # Save path
-        path_frame = ctk.CTkFrame(self)
-        path_frame.pack(fill="x", padx=10, pady=(0, 10))
-
-        ctk.CTkLabel(path_frame, text="Save to:").pack(side="left", padx=(5, 5))
+        top = ctk.CTkFrame(self)
+        top.pack(fill="x", padx=10, pady=10)
+        self.url_entry = ctk.CTkEntry(top, placeholder_text="Paste a file URL or supported video-page URL", height=36)
+        self.url_entry.pack(side="left", fill="x", expand=True, padx=5)
+        ctk.CTkButton(top, text="Add Download", command=self.add_download).pack(side="left", padx=5)
+        path = ctk.CTkFrame(self)
+        path.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(path, text="Save to:").pack(side="left", padx=5)
         self.save_path_var = ctk.StringVar(value=str(Path.home() / "Downloads"))
-        self.save_path_entry = ctk.CTkEntry(path_frame, textvariable=self.save_path_var, height=32)
-        self.save_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-
-        # Downloads list
+        ctk.CTkEntry(path, textvariable=self.save_path_var).pack(side="left", fill="x", expand=True, padx=5)
+        ctk.CTkButton(path, text="Browse…", width=90, command=self.browse_save_path).pack(side="left", padx=5)
+        self.connections_var = ctk.StringVar(value="8")
+        ctk.CTkLabel(path, text="Connections:").pack(side="left", padx=5)
+        ctk.CTkOptionMenu(path, variable=self.connections_var, values=["1", "2", "4", "8"], width=65).pack(side="left", padx=5)
         self.list_frame = ctk.CTkScrollableFrame(self, label_text="Downloads")
         self.list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        # Bottom controls
         bottom = ctk.CTkFrame(self)
         bottom.pack(fill="x", padx=10, pady=(0, 10))
-
-        ctk.CTkButton(bottom, text="Pause All", command=self.pause_all).pack(side="left", padx=5)
-        ctk.CTkButton(bottom, text="Resume All", command=self.resume_all).pack(side="left", padx=5)
-        ctk.CTkButton(bottom, text="Clear Completed", command=self.clear_completed).pack(side="left", padx=5)
+        for label, command in (("Pause All", self.pause_all), ("Resume All", self.resume_all), ("Clear Finished", self.clear_completed)):
+            ctk.CTkButton(bottom, text=label, command=command, width=120).pack(side="left", padx=5, pady=5)
+        self.status_label = ctk.CTkLabel(bottom, text="Starting browser bridge…")
+        self.status_label.pack(side="right", padx=10)
 
     def browse_save_path(self):
         path = filedialog.askdirectory(initialdir=self.save_path_var.get())
         if path:
             self.save_path_var.set(path)
-    def add_download_from_browser(self, url: str):
-        def _add():
-            self.url_entry.delete(0, "end")
-            self.url_entry.insert(0, url)
-            self.add_download()
+
+    def _poll(self):
+        for _ in range(100):
             try:
+                kind, value = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "command":
+                if not self.closing and value["action"] == "download":
+                    self.add_download(value["url"], value.get("headers", {}))
                 self.deiconify()
                 self.lift()
-                self.focus_force()
-            except Exception:
-                pass
+            elif kind == "progress":
+                self._update_task(value)
+            elif kind == "status":
+                self.status_label.configure(text=value)
+            elif kind == "closed":
+                self.loop.call_soon_threadsafe(self.loop.stop)
+                self.destroy()
+                return
+        self.after(100, self._poll)
 
-        self.after(0, _add)
-    def add_download(self):
-        url = self.url_entry.get().strip()
-        if not url:
-            messagebox.showwarning("Warning", "Please enter a URL")
+    def add_download(self, url=None, headers=None):
+        if self.closing:
             return
-
-        filename = url.split("/")[-1].split("?")[0] or "download"
-        save_path = str(Path(self.save_path_var.get()) / filename)
-
-        task = DownloadTask(url=url, save_path=save_path, connections=8)
-        self.downloader.tasks[url] = task
-
-        self._create_task_ui(task)
+        url = url or self.url_entry.get().strip()
+        try:
+            validate_url(url)
+            directory = Path(self.save_path_var.get()).expanduser()
+            directory.mkdir(parents=True, exist_ok=True)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror("Cannot add download", str(exc))
+            return
+        for existing in self.downloader.tasks.values():
+            if existing.url == url and existing.status in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED):
+                self.status_label.configure(text="That URL is already in the download list")
+                return
+        filename = safe_filename(Path(urlsplit(url).path).name or "Resolving video…")
+        task = DownloadTask(url, str(directory / filename), int(self.connections_var.get()), headers or {})
+        task_id = uuid.uuid4().hex
+        self.downloader.tasks[task_id] = task
+        self._create_task_ui(task_id, task)
         self.url_entry.delete(0, "end")
+        asyncio.run_coroutine_threadsafe(self.downloader.download(task, lambda _: self.events.put(("progress", task_id))), self.loop)
 
-        # Start download
-        asyncio.run_coroutine_threadsafe(
-            self.downloader.download(task, self.on_progress),
-            self.loop
-        )
-
-    def _create_task_ui(self, task: DownloadTask):
+    def _create_task_ui(self, task_id, task):
         frame = ctk.CTkFrame(self.list_frame)
         frame.pack(fill="x", pady=5, padx=5)
-
-        name_label = ctk.CTkLabel(frame, text=Path(task.save_path).name, anchor="w")
-        name_label.pack(fill="x", padx=10, pady=(5, 0))
-
+        name = ctk.CTkLabel(frame, text=Path(task.save_path).name, anchor="w")
+        name.pack(fill="x", padx=10, pady=(5, 0))
         progress = ctk.CTkProgressBar(frame)
         progress.set(0)
         progress.pack(fill="x", padx=10, pady=5)
+        info = ctk.CTkLabel(frame, text="Resolving download…", anchor="w", wraplength=820)
+        info.pack(fill="x", padx=10)
+        buttons = ctk.CTkFrame(frame, fg_color="transparent")
+        buttons.pack(fill="x", padx=10, pady=5)
+        pause = ctk.CTkButton(buttons, text="Pause", width=70, command=lambda: self.toggle_pause(task_id))
+        pause.pack(side="left", padx=3)
+        cancel = ctk.CTkButton(buttons, text="Cancel", width=70, fg_color="#c0392b", command=lambda: self.cancel_task(task_id))
+        cancel.pack(side="left", padx=3)
+        self.tasks_ui[task_id] = dict(frame=frame, name=name, progress=progress, info=info, pause=pause, cancel=cancel)
 
-        info_label = ctk.CTkLabel(frame, text="Starting...", anchor="w")
-        info_label.pack(fill="x", padx=10)
-
-        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(fill="x", padx=10, pady=5)
-
-        pause_btn = ctk.CTkButton(btn_frame, text="Pause", width=70,
-                                  command=lambda: self.toggle_pause(task))
-        pause_btn.pack(side="left", padx=3)
-
-        cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", width=70, fg_color="#c0392b",
-                                   command=lambda: self.cancel_task(task))
-        cancel_btn.pack(side="left", padx=3)
-
-        self.tasks_ui[task.url] = {
-            "frame": frame,
-            "progress": progress,
-            "info": info_label,
-            "pause_btn": pause_btn
-        }
-
-    def on_progress(self, task: DownloadTask):
-        if task.url not in self.tasks_ui:
+    def _update_task(self, task_id):
+        if task_id not in self.tasks_ui:
             return
+        task, ui = self.downloader.tasks[task_id], self.tasks_ui[task_id]
+        ui["name"].configure(text=Path(task.save_path).name)
+        ui["progress"].set(1 if task.status == DownloadStatus.COMPLETED else min(1, task.downloaded / task.total_size) if task.total_size else 0)
+        mb = task.downloaded / 1048576
+        total = f"{task.total_size / 1048576:.1f} MB" if task.total_size else "unknown size"
+        text = f"{task.status.value} • {mb:.1f} MB / {total} • {task.speed / 1048576:.1f} MB/s"
+        if task.status == DownloadStatus.FAILED:
+            text = f"Failed: {task.error}"
+        ui["info"].configure(text=text)
+        finished = task.status in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED)
+        ui["pause"].configure(text="Resume" if task.status == DownloadStatus.PAUSED else "Pause", state="disabled" if finished else "normal")
+        ui["cancel"].configure(state="disabled" if finished else "normal")
 
-        ui = self.tasks_ui[task.url]
-
-        def update():
-            if task.total_size > 0:
-                percent = task.downloaded / task.total_size
-                ui["progress"].set(percent)
-            else:
-                ui["progress"].set(0)
-
-            downloaded_mb = task.downloaded / (1024 * 1024)
-            total_mb = task.total_size / (1024 * 1024)
-            speed_mb = task.speed / (1024 * 1024)
-
-            if task.status == DownloadStatus.COMPLETED:
-                text = f"Completed • {total_mb:.1f} MB"
-                ui["pause_btn"].configure(state="disabled")
-            elif task.status == DownloadStatus.PAUSED:
-                text = f"Paused • {downloaded_mb:.1f}/{total_mb:.1f} MB"
-            elif task.status == DownloadStatus.FAILED:
-                text = f"Failed: {task.error}"
-            elif task.status == DownloadStatus.CANCELLED:
-                text = "Cancelled"
-            else:
-                eta_min = int(task.eta // 60)
-                eta_sec = int(task.eta % 60)
-                text = f"{downloaded_mb:.1f}/{total_mb:.1f} MB • {speed_mb:.1f} MB/s • ETA {eta_min:02d}:{eta_sec:02d}"
-
-            ui["info"].configure(text=text)
-
-        self.after(0, update)
-
-    def toggle_pause(self, task: DownloadTask):
-        if task.status == DownloadStatus.DOWNLOADING:
-            self.downloader.pause(task)
-            self.tasks_ui[task.url]["pause_btn"].configure(text="Resume")
-        elif task.status == DownloadStatus.PAUSED:
+    def toggle_pause(self, task_id):
+        task = self.downloader.tasks[task_id]
+        if task.status == DownloadStatus.PAUSED:
             self.downloader.resume(task)
-            self.tasks_ui[task.url]["pause_btn"].configure(text="Pause")
-            # Restart the download coroutine if needed (simple version)
-            asyncio.run_coroutine_threadsafe(
-                self.downloader.download(task, self.on_progress),
-                self.loop
-            )
+        else:
+            self.downloader.pause(task)
+        self._update_task(task_id)
 
-    def cancel_task(self, task: DownloadTask):
-        self.downloader.cancel(task)
-        if task.url in self.tasks_ui:
-            self.tasks_ui[task.url]["frame"].destroy()
-            del self.tasks_ui[task.url]
+    def cancel_task(self, task_id):
+        self.downloader.cancel(self.downloader.tasks[task_id])
+        self._update_task(task_id)
 
     def pause_all(self):
-        for task in self.downloader.tasks.values():
-            if task.status == DownloadStatus.DOWNLOADING:
-                self.downloader.pause(task)
-                if task.url in self.tasks_ui:
-                    self.tasks_ui[task.url]["pause_btn"].configure(text="Resume")
+        for task_id, task in self.downloader.tasks.items():
+            self.downloader.pause(task)
+            self._update_task(task_id)
 
     def resume_all(self):
-        for task in self.downloader.tasks.values():
-            if task.status == DownloadStatus.PAUSED:
-                self.downloader.resume(task)
-                if task.url in self.tasks_ui:
-                    self.tasks_ui[task.url]["pause_btn"].configure(text="Pause")
-                asyncio.run_coroutine_threadsafe(
-                    self.downloader.download(task, self.on_progress),
-                    self.loop
-                )
+        for task_id, task in self.downloader.tasks.items():
+            self.downloader.resume(task)
+            self._update_task(task_id)
 
     def clear_completed(self):
-        to_remove = []
-        for url, task in self.downloader.tasks.items():
-            if task.status in (DownloadStatus.COMPLETED, DownloadStatus.CANCELLED, DownloadStatus.FAILED):
-                if url in self.tasks_ui:
-                    self.tasks_ui[url]["frame"].destroy()
-                    del self.tasks_ui[url]
-                to_remove.append(url)
-        for url in to_remove:
-            del self.downloader.tasks[url]
+        for task_id, task in list(self.downloader.tasks.items()):
+            if not task._running and task.status in (DownloadStatus.COMPLETED, DownloadStatus.CANCELLED, DownloadStatus.FAILED):
+                self.tasks_ui.pop(task_id)["frame"].destroy()
+                del self.downloader.tasks[task_id]
 
     def on_closing(self):
-        asyncio.run_coroutine_threadsafe(self.downloader.close(), self.loop)
-        self.loop.call_soon_threadsafe(self.loop.stop)
-        self.destroy()
+        if self.closing:
+            return
+        self.closing = True
+        self.status_label.configure(text="Stopping downloads…")
+        async def shutdown():
+            await self.command_server.stop()
+            await self.downloader.close()
+            self.events.put(("closed", None))
+        asyncio.run_coroutine_threadsafe(shutdown(), self.loop)

@@ -1,43 +1,45 @@
 import asyncio
 import json
-from typing import Callable, Optional
+from core.downloader import validate_url
 
 HOST = "127.0.0.1"
 PORT = 56789
 
+
 class CommandServer:
-    def __init__(self, on_download: Callable[[str], None]):
-        self.on_download = on_download
-        self._server: Optional[asyncio.AbstractServer] = None
+    def __init__(self, on_command):
+        self.on_command = on_command
+        self._server = None
 
-    async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    async def handle_client(self, reader, writer):
         try:
-            data = await reader.readline()
-            if not data:
-                return
-
-            message = json.loads(data.decode("utf-8").strip())
-            if message.get("action") == "download" and message.get("url"):
-                self.on_download(message["url"])
-                response = {"status": "ok"}
-            else:
-                response = {"status": "error", "message": "Invalid request"}
-
-            writer.write((json.dumps(response) + "\n").encode("utf-8"))
+            data = await asyncio.wait_for(reader.readline(), timeout=5)
+            message = json.loads(data)
+            action = message.get("action")
+            if action == "download":
+                validate_url(message.get("url", ""))
+                headers = message.get("headers", {})
+                if not isinstance(headers, dict):
+                    raise ValueError("Invalid headers")
+                message["headers"] = {key: value for key, value in headers.items()
+                                      if key in ("Referer", "User-Agent") and isinstance(value, str)
+                                      and "\r" not in value and "\n" not in value}
+            elif action not in ("open", "ping"):
+                raise ValueError("Unknown action")
+            if action != "ping":
+                self.on_command(message)
+            response = {"status": "ok", "message": "Accepted by IDM Clone"}
+        except Exception as exc:
+            response = {"status": "error", "message": str(exc)}
+        try:
+            writer.write((json.dumps(response) + "\n").encode())
             await writer.drain()
-        except Exception as e:
-            try:
-                writer.write((json.dumps({"status": "error", "message": str(e)}) + "\n").encode("utf-8"))
-                await writer.drain()
-            except Exception:
-                pass
         finally:
             writer.close()
             await writer.wait_closed()
 
     async def start(self):
         self._server = await asyncio.start_server(self.handle_client, HOST, PORT)
-        print(f"Command server listening on {HOST}:{PORT}")
 
     async def stop(self):
         if self._server:
