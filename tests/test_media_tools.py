@@ -85,7 +85,7 @@ class SplitStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.skipTest('Run scripts/prepare_media_tools.py for the split-stream integration test')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            subprocess.run([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=64x64:r=10', '-t', '0.5', '-an', '-c:v', 'mpeg4', str(root / 'video.mp4')], check=True, capture_output=True)
+            subprocess.run([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'color=c=blue:s=640x360:r=10', '-t', '0.5', '-an', '-c:v', 'mpeg4', str(root / 'video.mp4')], check=True, capture_output=True)
             subprocess.run([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440', '-t', '0.5', '-vn', '-c:a', 'aac', str(root / 'audio.m4a')], check=True, capture_output=True)
             app = web.Application()
             async def serve(request):
@@ -98,17 +98,21 @@ class SplitStreamIntegrationTests(unittest.IsolatedAsyncioTestCase):
             base = f'http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}'
             info = {'id':'split-fixture', 'title':'Split fixture', 'formats':[
                 {'format_id':'audio','url':base + '/audio.m4a','ext':'m4a','vcodec':'none','acodec':'aac'},
-                {'format_id':'video','url':base + '/video.mp4','ext':'mp4','vcodec':'mpeg4','acodec':'none','height':64},
+                {'format_id':'video','url':base + '/video.mp4','ext':'mp4','vcodec':'mpeg4','acodec':'none','height':360},
             ]}
             def extract(ydl, url, download=False):
                 return ydl.process_ie_result(copy.deepcopy(info), download=download)
             task = DownloadTask(base + '/page', str(root / 'output/pending'))
             try:
                 with patch.object(YoutubeDL, 'extract_info', extract):
-                    await asyncio.to_thread(MultiConnectionDownloader()._download_media, task, None)
-                result = subprocess.run([ffprobe, '-v','error','-show_entries','stream=codec_type','-of','json', task.save_path], capture_output=True, text=True, check=True)
+                    await asyncio.to_thread(MultiConnectionDownloader(format_picker=lambda task, title, choices: choices[0])._download_media, task, None)
+                self.assertEqual(task.video_choice.extension, 'mp4')
+                self.assertEqual(task.video_choice.height, 360)
+                result = subprocess.run([ffprobe, '-v','error','-show_entries','stream=codec_type,height','-of','json', task.save_path], capture_output=True, text=True, check=True)
                 streams = json.loads(result.stdout)['streams']
                 self.assertEqual({stream['codec_type'] for stream in streams}, {'video','audio'})
+                self.assertEqual(next(s['height'] for s in streams if s['codec_type'] == 'video'), 360)
+                self.assertEqual(Path(task.save_path).suffix, '.mp4')
                 self.assertEqual(len(list((root / 'output').iterdir())), 1)
             finally:
                 await runner.cleanup()

@@ -14,10 +14,12 @@ from urllib.parse import unquote, urlsplit
 import aiofiles
 import aiohttp
 from core.media_tools import media_options, explain_media_error
+from core.video_formats import available_choices, choice_options, VideoChoice
 
 
 class DownloadStatus(Enum):
     PENDING = "Pending"
+    SELECTING = "Choose format"
     DOWNLOADING = "Downloading"
     PAUSED = "Paused"
     COMPLETED = "Completed"
@@ -67,6 +69,7 @@ class DownloadTask:
     speed: float = 0.0
     eta: float = 0.0
     error: str | None = None
+    video_choice: VideoChoice | None = None
     _pause_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _cancel: bool = False
     _running: bool = False
@@ -78,10 +81,11 @@ class DownloadTask:
 
 
 class MultiConnectionDownloader:
-    def __init__(self, max_connections=8):
+    def __init__(self, max_connections=8, format_picker=None):
         self.max_connections = max_connections
         self.tasks = {}
         self._session = None
+        self.format_picker = format_picker
 
     async def _get_session(self):
         if self._session is None or self._session.closed:
@@ -231,6 +235,8 @@ class MultiConnectionDownloader:
         tools = media_options()
         if _hls_retry:
             tools["format"] = "bestvideo*[protocol^=m3u8]+bestaudio[protocol^=m3u8]/best[protocol^=m3u8]"
+        if task.video_choice:
+            tools.update(choice_options(task.video_choice, hls=_hls_retry))
 
         class QuietLogger:
             def debug(self, message): pass
@@ -270,6 +276,27 @@ class MultiConnectionDownloader:
                         raise ValueError("Live stream recording is not supported yet.")
                     if info.get("has_drm"):
                         raise ValueError("This video is DRM protected.")
+                    if self.format_picker and task.video_choice is None:
+                        choices = available_choices(info, bool(tools.get("ffmpeg_location")))
+                        if choices:
+                            task.status = DownloadStatus.SELECTING
+                            if callback:
+                                callback(task)
+                            choice = self.format_picker(task, info.get("title", "Video"), choices)
+                            if choice is None or task._cancel:
+                                self.cancel(task)
+                                raise ValueError("Download cancelled")
+                            if choice not in choices:
+                                raise ValueError("That video format is unavailable")
+                            task.video_choice = choice
+                            task.status = DownloadStatus.DOWNLOADING
+                            tools.update(choice_options(choice))
+                            ydl.params.update(choice_options(choice))
+                            ydl.format_selector = ydl.build_format_selector(ydl.params["format"])
+                            # Refresh signed URLs and select without stale merged-format metadata.
+                            info = ydl.extract_info(task.url, download=False)
+                            if callback:
+                                callback(task)
                     hook({})
                     ydl.process_info(info)
                 files = [path for path in Path(scratch).iterdir() if path.suffix not in (".part", ".ytdl", ".temp")]
@@ -295,6 +322,8 @@ class MultiConnectionDownloader:
                 task.downloaded = task.total_size = task._last_downloaded = 0
                 task._last_time = time.monotonic()
                 return self._download_media(task, callback, _hls_retry=True)
+            if task.video_choice and "Requested format is not available" in str(exc):
+                raise ValueError(f"{task.video_choice.label} is no longer available for this video. Add the URL again and choose another format.") from exc
             raise ValueError(explain_media_error(exc, tools, warnings)) from exc
 
     def pause(self, task):

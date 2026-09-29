@@ -29,6 +29,18 @@ media URLs detected during playback. For `blob:` players, choose a detected sour
 or **Resolve video from this page**. Multiple sources can belong to ads or different
 players; choose the appropriate one. Right-click file links for **Download with IDM Clone**.
 
+### Choose a video file type and resolution
+
+When a video page or streaming source is added, the desktop app fetches its available
+formats and opens **Choose video format**. Select a file type (such as MP4 or WebM),
+then a resolution and click **Download**. Only available choices with audio are
+listed; resolutions are the source's actual pixel heights (portrait videos can
+have nonstandard heights). The app does not upscale or convert unavailable formats.
+The selected type and resolution appear beside the download name. Cancel closes
+the picker without downloading. Ordinary file links continue to download directly.
+If the selected quality becomes unavailable, the app reports an error instead of
+silently choosing another quality. The YouTube streaming retry preserves the choice.
+
 To hand off ordinary browser downloads, enable **Send browser downloads to IDM Clone**
 in the extension popup. It is off by default. The browser keeps its download if the
 native bridge cannot accept it. Acceptance means queued in the app; later HTTP or

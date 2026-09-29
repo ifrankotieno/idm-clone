@@ -2,6 +2,7 @@ import asyncio
 import queue
 import threading
 import uuid
+from concurrent.futures import Future, TimeoutError
 from pathlib import Path
 from tkinter import filedialog, messagebox
 from urllib.parse import urlsplit
@@ -9,6 +10,7 @@ from urllib.parse import urlsplit
 import customtkinter as ctk
 from core.downloader import MultiConnectionDownloader, DownloadTask, DownloadStatus, safe_filename, validate_url
 from core.command_server import CommandServer
+from gui.video_picker import VideoPicker
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -20,7 +22,8 @@ class DownloadManagerApp(ctk.CTk):
         self.title("IDM Clone - Download Manager")
         self.geometry("1000x600")
         self.minsize(900, 500)
-        self.downloader = MultiConnectionDownloader()
+        self.downloader = MultiConnectionDownloader(format_picker=self.choose_video_format)
+        self.pickers = {}
         self.loop = asyncio.new_event_loop()
         self.events = queue.Queue()
         self.tasks_ui = {}
@@ -87,6 +90,17 @@ class DownloadManagerApp(ctk.CTk):
                 self.lift()
             elif kind == "progress":
                 self._update_task(value)
+            elif kind == "formats":
+                task, title, choices, result = value
+                if self.closing or task._cancel or result.done():
+                    if not result.done():
+                        result.set_result(None)
+                else:
+                    def complete(choice, result=result, key=id(task)):
+                        self.pickers.pop(key, None)
+                        if not result.done():
+                            result.set_result(choice)
+                    self.pickers[id(task)] = VideoPicker(self, title, choices, complete)
             elif kind == "status":
                 self.status_label.configure(text=value)
             elif kind == "closed":
@@ -107,7 +121,7 @@ class DownloadManagerApp(ctk.CTk):
             messagebox.showerror("Cannot add download", str(exc))
             return
         for existing in self.downloader.tasks.values():
-            if existing.url == url and existing.status in (DownloadStatus.PENDING, DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED):
+            if existing.url == url and existing.status in (DownloadStatus.PENDING, DownloadStatus.SELECTING, DownloadStatus.DOWNLOADING, DownloadStatus.PAUSED):
                 self.status_label.configure(text="That URL is already in the download list")
                 return
         filename = safe_filename(Path(urlsplit(url).path).name or "Resolving video…")
@@ -117,6 +131,17 @@ class DownloadManagerApp(ctk.CTk):
         self._create_task_ui(task_id, task)
         self.url_entry.delete(0, "end")
         asyncio.run_coroutine_threadsafe(self.downloader.download(task, lambda _: self.events.put(("progress", task_id))), self.loop)
+
+    def choose_video_format(self, task, title, choices):
+        result = Future()
+        self.events.put(("formats", (task, title, choices, result)))
+        while not task._cancel:
+            try:
+                return result.result(timeout=0.2)
+            except TimeoutError:
+                continue
+        result.cancel()
+        return None
 
     def _create_task_ui(self, task_id, task):
         frame = ctk.CTkFrame(self.list_frame)
@@ -140,16 +165,19 @@ class DownloadManagerApp(ctk.CTk):
         if task_id not in self.tasks_ui:
             return
         task, ui = self.downloader.tasks[task_id], self.tasks_ui[task_id]
-        ui["name"].configure(text=Path(task.save_path).name)
+        selected = f"  [{task.video_choice.label}]" if task.video_choice else ""
+        ui["name"].configure(text=Path(task.save_path).name + selected)
         ui["progress"].set(1 if task.status == DownloadStatus.COMPLETED else min(1, task.downloaded / task.total_size) if task.total_size else 0)
         mb = task.downloaded / 1048576
         total = f"{task.total_size / 1048576:.1f} MB" if task.total_size else "unknown size"
         text = f"{task.status.value} • {mb:.1f} MB / {total} • {task.speed / 1048576:.1f} MB/s"
         if task.status == DownloadStatus.FAILED:
             text = f"Failed: {task.error}"
+        elif task.status == DownloadStatus.SELECTING:
+            text = "Choose a file type and resolution in the video format window."
         ui["info"].configure(text=text)
         finished = task.status in (DownloadStatus.COMPLETED, DownloadStatus.FAILED, DownloadStatus.CANCELLED)
-        ui["pause"].configure(text="Resume" if task.status == DownloadStatus.PAUSED else "Pause", state="disabled" if finished else "normal")
+        ui["pause"].configure(text="Resume" if task.status == DownloadStatus.PAUSED else "Pause", state="disabled" if finished or task.status == DownloadStatus.SELECTING else "normal")
         ui["cancel"].configure(state="disabled" if finished else "normal")
 
     def toggle_pause(self, task_id):
@@ -162,6 +190,9 @@ class DownloadManagerApp(ctk.CTk):
 
     def cancel_task(self, task_id):
         self.downloader.cancel(self.downloader.tasks[task_id])
+        picker = self.pickers.get(id(self.downloader.tasks[task_id]))
+        if picker:
+            picker.finish(None)
         self._update_task(task_id)
 
     def pause_all(self):
@@ -184,6 +215,8 @@ class DownloadManagerApp(ctk.CTk):
         if self.closing:
             return
         self.closing = True
+        for picker in list(self.pickers.values()):
+            picker.finish(None)
         self.status_label.configure(text="Stopping downloads…")
         async def shutdown():
             await self.command_server.stop()
